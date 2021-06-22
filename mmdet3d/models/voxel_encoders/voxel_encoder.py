@@ -5,7 +5,7 @@ from torch import nn
 
 from mmdet3d.ops import DynamicScatter
 from .. import builder
-from ..builder import VOXEL_ENCODERS
+from ..registry import VOXEL_ENCODERS
 from .utils import VFELayer, get_paddings_indicator
 
 
@@ -163,7 +163,7 @@ class DynamicVFE(nn.Module):
                 nn.Sequential(
                     nn.Linear(in_filters, out_filters, bias=False), norm_layer,
                     nn.ReLU(inplace=True)))
-        self.vfe_layers = nn.ModuleList(vfe_layers)
+            self.vfe_layers = nn.ModuleList(vfe_layers)
         self.num_vfe = len(vfe_layers)
         self.vfe_scatter = DynamicScatter(voxel_size, point_cloud_range,
                                           (mode != 'max'))
@@ -238,6 +238,7 @@ class DynamicVFE(nn.Module):
                 its coordinates. If `return_point_feats` is True, returns
                 feature of each points inside voxels.
         """
+        
         features_ls = [features]
         # Find distance of x, y, and z from cluster center
         if self._with_cluster_center:
@@ -338,7 +339,7 @@ class HardVFE(nn.Module):
         self._with_voxel_center = with_voxel_center
         self.return_point_feats = return_point_feats
         self.fp16_enabled = False
-
+        torch.autograd.set_detect_anomaly(True)
         # Need pillar (voxel) size and x/y offset to calculate pillar offset
         self.vx = voxel_size[0]
         self.vy = voxel_size[1]
@@ -379,6 +380,12 @@ class HardVFE(nn.Module):
         self.fusion_layer = None
         if fusion_layer is not None:
             self.fusion_layer = builder.build_fusion_layer(fusion_layer)
+        self.fc1 = nn.Sequential(
+                    nn.Linear(200, 200, bias=True),
+                    nn.ReLU(inplace=True))
+        self.fc2 = nn.Sequential(
+                    nn.Linear(200, 200, bias=True),
+                    nn.ReLU(inplace=True))
 
     @force_fp32(out_fp16=True)
     def forward(self,
@@ -402,6 +409,8 @@ class HardVFE(nn.Module):
                 its coordinates. If `return_point_feats` is True, returns
                 feature of each points inside voxels.
         """
+        import numpy as np
+
         features_ls = [features]
         # Find distance of x, y, and z from cluster center
         if self._with_cluster_center:
@@ -411,7 +420,7 @@ class HardVFE(nn.Module):
             # TODO: maybe also do cluster for reflectivity
             f_cluster = features[:, :, :3] - points_mean
             features_ls.append(f_cluster)
-
+        
         # Find distance of x, y, and z from pillar center
         if self._with_voxel_center:
             f_center = features.new_zeros(
@@ -427,27 +436,40 @@ class HardVFE(nn.Module):
                 self.z_offset)
             features_ls.append(f_center)
 
+#         '''
         if self._with_distance:
             points_dist = torch.norm(features[:, :, :3], 2, 2, keepdim=True)
             features_ls.append(points_dist)
-
         # Combine together feature decorations
         voxel_feats = torch.cat(features_ls, dim=-1)
+
+#         '''
+#         voxel_feats = 
         # The feature decorations were calculated without regard to whether
         # pillar was empty.
         # Need to ensure that empty voxels remain set to zeros.
+        R_voxel_feats = voxel_feats
         voxel_count = voxel_feats.shape[1]
         mask = get_paddings_indicator(num_points, voxel_count, axis=0)
+        R_voxel_feats = torch.reshape(R_voxel_feats,[np.shape(voxel_feats)[0],20,10]).type_as(voxel_feats)
         voxel_feats *= mask.unsqueeze(-1).type_as(voxel_feats)
+        voxel_feats = self.fc1(torch.reshape(voxel_feats,[np.shape(voxel_feats)[0],-1])).type_as(voxel_feats)
+
+#         voxel_feats = self.fc(torch.reshape(voxel_feats,[np.shape(voxel_feats)[0],-1])).type_as(voxel_feats)
+        voxel_feats = torch.reshape(voxel_feats,[np.shape(voxel_feats)[0],20,10]).type_as(voxel_feats)
+
+        total_voxel_feats = voxel_feats * mask.unsqueeze(-1).type_as(voxel_feats) * 0.8 + R_voxel_feats * 0.2
+        total_voxel_feats = self.fc2(torch.reshape(total_voxel_feats,[np.shape(total_voxel_feats)[0],-1])) 
+        total_voxel_feats = torch.reshape(total_voxel_feats,[np.shape(voxel_feats)[0],20,10]).type_as(voxel_feats)
 
         for i, vfe in enumerate(self.vfe_layers):
-            voxel_feats = vfe(voxel_feats)
+            total_voxel_feats = vfe(total_voxel_feats)
 
         if (self.fusion_layer is not None and img_feats is not None):
-            voxel_feats = self.fusion_with_mask(features, mask, voxel_feats,
+            total_voxel_feats = self.fusion_with_mask(features, mask, total_voxel_feats,
                                                 coors, img_feats, img_metas)
 
-        return voxel_feats
+        return total_voxel_feats
 
     def fusion_with_mask(self, features, mask, voxel_feats, coors, img_feats,
                          img_metas):
